@@ -536,6 +536,31 @@ async def create_mongodb_card(
 
 
 # =============================================================================
+# Tool Definitions - Dashboard Operations
+# =============================================================================
+
+@mcp.tool
+async def list_dashboards(ctx: Context) -> list[dict[str, Any]]:
+    """
+    List all dashboards in Metabase.
+
+    Returns:
+        A list of dashboards with their metadata including id, name,
+        description, collection_id, and creator info.
+    """
+    try:
+        await ctx.info("Fetching list of dashboards from Metabase")
+        result = await metabase_client.request("GET", "/dashboard")
+        dashboard_count = len(result) if isinstance(result, list) else len(result.get("data", []))
+        await ctx.info(f"Successfully retrieved {dashboard_count} dashboards")
+        return result
+    except Exception as e:
+        error_msg = f"Error listing dashboards: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+# =============================================================================
 # Tool Definitions - Collection Operations
 # =============================================================================
 
