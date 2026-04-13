@@ -106,6 +106,11 @@ METABASE_USER_EMAIL=your-email@example.com
 METABASE_PASSWORD=your-password
 ```
 
+#### Optional: Metabase API HTTP Timeout
+```env
+METABASE_HTTP_TIMEOUT=30.0  # Default: 30.0 seconds
+```
+
 #### Optional: Custom Host/Port for SSE/HTTP
 ```env
 HOST=localhost  # Default: 0.0.0.0
