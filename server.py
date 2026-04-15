@@ -31,15 +31,6 @@ METABASE_URL = os.getenv("METABASE_URL")
 METABASE_USER_EMAIL = os.getenv("METABASE_USER_EMAIL")
 METABASE_PASSWORD = os.getenv("METABASE_PASSWORD")
 METABASE_API_KEY = os.getenv("METABASE_API_KEY")
-METABASE_HTTP_TIMEOUT = os.getenv("METABASE_HTTP_TIMEOUT", "30.0")
-
-try:
-    METABASE_HTTP_TIMEOUT_SECONDS = float(METABASE_HTTP_TIMEOUT)
-except ValueError as exc:
-    raise ValueError("METABASE_HTTP_TIMEOUT must be a valid number (seconds)") from exc
-
-if METABASE_HTTP_TIMEOUT_SECONDS <= 0:
-    raise ValueError("METABASE_HTTP_TIMEOUT must be greater than 0")
 
 if not METABASE_URL or (
     not METABASE_API_KEY and (not METABASE_USER_EMAIL or not METABASE_PASSWORD)
@@ -74,7 +65,7 @@ class MetabaseClient:
         self.session_token: str | None = None
         self.api_key: str | None = METABASE_API_KEY
         self.auth_method = AuthMethod.API_KEY if METABASE_API_KEY else AuthMethod.SESSION
-        self.client = httpx.AsyncClient(timeout=METABASE_HTTP_TIMEOUT_SECONDS)
+        self.client = httpx.AsyncClient(timeout=30.0)
 
         logger.info(f"Using {self.auth_method.value} authentication method")
 
@@ -545,6 +536,225 @@ async def create_mongodb_card(
 
 
 @mcp.tool
+async def update_card(
+    card_id: int,
+    ctx: Context,
+    name: str | None = None,
+    description: str | None = None,
+    query: str | None = None,
+    database_id: int | None = None,
+    display: str | None = None,
+    collection_id: int | None = None,
+    visualization_settings: dict[str, Any] | None = None,
+    archived: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Update properties of a saved question/card in Metabase.
+
+    Args:
+        card_id: The ID of the card to update.
+        name: New name for the card.
+        description: New description for the card.
+        query: New SQL query for the card.
+        database_id: New database ID (required if changing query).
+        display: Display type (e.g. "table", "bar", "line", "pie", "scalar", "row", "area", "combo", "pivot", "smartscalar", "funnel", "waterfall", "map").
+        collection_id: Move the card to a different collection.
+        visualization_settings: Visualization settings to apply.
+        archived: Set to true to archive the card, false to unarchive.
+
+    Returns:
+        The updated card object.
+    """
+    try:
+        await ctx.info(f"Updating card {card_id}")
+
+        payload: dict[str, Any] = {}
+
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if display is not None:
+            payload["display"] = display
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+        if visualization_settings is not None:
+            payload["visualization_settings"] = visualization_settings
+        if archived is not None:
+            payload["archived"] = archived
+        if query is not None:
+            db = database_id
+            if db is None:
+                # Fetch current card to get existing database_id
+                current_card = await metabase_client.request("GET", f"/card/{card_id}")
+                db = current_card.get("database_id")
+                await ctx.debug(f"Using existing database_id {db} for query update")
+            payload["dataset_query"] = {
+                "database": db,
+                "type": "native",
+                "native": {"query": query},
+            }
+
+        if not payload:
+            raise ToolError("No update fields provided. Specify at least one field to update.")
+
+        result = await metabase_client.request("PUT", f"/card/{card_id}", json=payload)
+        await ctx.info(f"Successfully updated card {card_id}")
+
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = f"Error updating card {card_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def create_model(
+    name: str,
+    database_id: int,
+    query: str,
+    ctx: Context,
+    description: str | None = None,
+    collection_id: int | None = None,
+    result_metadata: list[dict[str, Any]] | None = None,
+    visualization_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Create a new model in Metabase.
+
+    A model is a special type of saved question that acts as a curated dataset.
+    Models can define metadata for their columns and serve as building blocks
+    for other questions.
+
+    Args:
+        name: Name of the model.
+        database_id: ID of the database to query.
+        query: SQL query that defines the model.
+        description: Optional description of the model.
+        collection_id: Optional collection to place the model in.
+        result_metadata: Optional list of column metadata dicts. Each dict can include
+            keys like "name", "display_name", "base_type", "semantic_type",
+            "description", and "field_ref".
+        visualization_settings: Optional visualization configuration.
+
+    Returns:
+        The created model object.
+    """
+    try:
+        await ctx.info(f"Creating new model '{name}' in database {database_id}")
+
+        payload: dict[str, Any] = {
+            "name": name,
+            "type": "model",
+            "database_id": database_id,
+            "dataset_query": {
+                "database": database_id,
+                "type": "native",
+                "native": {"query": query},
+            },
+            "display": "table",
+            "visualization_settings": visualization_settings or {},
+        }
+
+        if description:
+            payload["description"] = description
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+            await ctx.debug(f"Model will be placed in collection {collection_id}")
+        if result_metadata is not None:
+            payload["result_metadata"] = result_metadata
+            await ctx.debug(f"Model will have {len(result_metadata)} column metadata entries")
+
+        result = await metabase_client.request("POST", "/card", json=payload)
+        await ctx.info(f"Successfully created model with ID {result.get('id')}")
+
+        return result
+    except Exception as e:
+        error_msg = f"Error creating model: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def update_model(
+    card_id: int,
+    ctx: Context,
+    name: str | None = None,
+    description: str | None = None,
+    query: str | None = None,
+    database_id: int | None = None,
+    collection_id: int | None = None,
+    result_metadata: list[dict[str, Any]] | None = None,
+    visualization_settings: dict[str, Any] | None = None,
+    archived: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Update an existing model in Metabase.
+
+    Args:
+        card_id: The ID of the model to update.
+        name: New name for the model.
+        description: New description for the model.
+        query: New SQL query for the model.
+        database_id: New database ID (required if changing query).
+        collection_id: Move the model to a different collection.
+        result_metadata: Updated column metadata list. Each dict can include
+            keys like "name", "display_name", "base_type", "semantic_type",
+            "description", and "field_ref".
+        visualization_settings: Visualization settings to apply.
+        archived: Set to true to archive the model, false to unarchive.
+
+    Returns:
+        The updated model object.
+    """
+    try:
+        await ctx.info(f"Updating model {card_id}")
+
+        payload: dict[str, Any] = {}
+
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+        if result_metadata is not None:
+            payload["result_metadata"] = result_metadata
+            await ctx.debug(f"Updating {len(result_metadata)} column metadata entries")
+        if visualization_settings is not None:
+            payload["visualization_settings"] = visualization_settings
+        if archived is not None:
+            payload["archived"] = archived
+        if query is not None:
+            db = database_id
+            if db is None:
+                current_card = await metabase_client.request("GET", f"/card/{card_id}")
+                db = current_card.get("database_id")
+                await ctx.debug(f"Using existing database_id {db} for query update")
+            payload["dataset_query"] = {
+                "database": db,
+                "type": "native",
+                "native": {"query": query},
+            }
+
+        if not payload:
+            raise ToolError("No update fields provided. Specify at least one field to update.")
+
+        result = await metabase_client.request("PUT", f"/card/{card_id}", json=payload)
+        await ctx.info(f"Successfully updated model {card_id}")
+
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = f"Error updating model {card_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
 async def update_card_display(
     card_id: int,
     display: str,
@@ -602,6 +812,50 @@ async def list_dashboards(ctx: Context) -> list[dict[str, Any]]:
         return result
     except Exception as e:
         error_msg = f"Error listing dashboards: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def create_dashboard(
+    name: str,
+    ctx: Context,
+    description: str | None = None,
+    collection_id: int | None = None,
+    parameters: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Create a new dashboard in Metabase.
+
+    Args:
+        name: Name of the dashboard.
+        description: Optional description of the dashboard.
+        collection_id: Optional collection ID to place the dashboard in.
+        parameters: Optional list of parameter/filter configurations for the dashboard.
+
+    Returns:
+        The created dashboard object.
+    """
+    try:
+        await ctx.info(f"Creating new dashboard '{name}'")
+
+        payload: dict[str, Any] = {"name": name}
+
+        if description:
+            payload["description"] = description
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+            await ctx.debug(f"Dashboard will be placed in collection {collection_id}")
+        if parameters:
+            payload["parameters"] = parameters
+            await ctx.debug(f"Dashboard will have {len(parameters)} parameters")
+
+        result = await metabase_client.request("POST", "/dashboard", json=payload)
+        await ctx.info(f"Successfully created dashboard with ID {result.get('id')}")
+
+        return result
+    except Exception as e:
+        error_msg = f"Error creating dashboard: {e}"
         await ctx.error(error_msg)
         raise ToolError(error_msg) from e
 
@@ -728,17 +982,42 @@ async def add_card_to_dashboard(
 # =============================================================================
 
 @mcp.tool
-async def list_collections(ctx: Context) -> dict[str, Any]:
+async def list_collections(
+    ctx: Context,
+    archived: bool = False,
+    exclude_other_user_collections: bool = False,
+    namespace: str | None = None,
+    personal_only: bool = False,
+) -> dict[str, Any]:
     """
-    List all collections in Metabase.
+    List all collections in Metabase that the current user has read permissions for.
+
+    Args:
+        archived: If true, return only archived collections.
+        exclude_other_user_collections: If true, hide other users' personal collections.
+        namespace: Filter collections by namespace (e.g. "snippets" for snippet folders).
+        personal_only: If true, return only personal collections (where personal_owner_id is not null).
 
     Returns:
         Dictionary containing all collections with their metadata.
     """
     try:
         await ctx.info("Fetching list of collections")
-        result = await metabase_client.request("GET", "/collection")
-        collection_count = len(result) if isinstance(result, list) else len(result.get("data", []))
+        query_params: dict[str, Any] = {}
+        if archived:
+            query_params["archived"] = "true"
+        if exclude_other_user_collections:
+            query_params["exclude-other-user-collections"] = "true"
+        if namespace is not None:
+            query_params["namespace"] = namespace
+        if personal_only:
+            query_params["personal-only"] = "true"
+        result = await metabase_client.request("GET", "/collection", params=query_params or None)
+        if isinstance(result, list):
+            collection_count = len(result)
+            await ctx.info(f"Successfully retrieved {collection_count} collections")
+            return {"data": result, "total": collection_count}
+        collection_count = len(result.get("data", []))
         await ctx.info(f"Successfully retrieved {collection_count} collections")
         return result
     except Exception as e:
