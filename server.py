@@ -257,6 +257,65 @@ async def get_table_fields(table_id: int, ctx: Context, limit: int = 20) -> dict
 
 
 # =============================================================================
+# Internal helpers for native-query dataset_query shapes
+# =============================================================================
+
+def _read_native_stage(
+    dataset_query: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    """
+    Return (sql, template_tags) from a card's dataset_query.
+
+    Handles both Metabase shapes:
+      - stages shape: dataset_query.stages[0] = {"native": "<SQL>", "template-tags": {...}, ...}
+      - legacy shape: dataset_query.native = {"query": "<SQL>", "template-tags": {...}}
+    """
+    stages = dataset_query.get("stages")
+    if isinstance(stages, list) and stages:
+        stage = stages[0] or {}
+        return stage.get("native"), dict(stage.get("template-tags") or {})
+    native = dataset_query.get("native") or {}
+    return native.get("query"), dict(native.get("template-tags") or {})
+
+
+def _merge_native_stage(
+    dataset_query: dict[str, Any],
+    *,
+    sql: str | None = None,
+    template_tags: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Return a shallow-copy of `dataset_query` with `sql` and/or `template-tags`
+    applied to the native stage, preserving all sibling fields (native/stages,
+    lib/type, collection, etc.). Leaves root-level keys like database/type
+    untouched — callers override those explicitly if needed.
+
+    Pass only the fields you want to change: unset args keep their current values.
+    """
+    new_dq = dict(dataset_query)
+
+    stages = dataset_query.get("stages")
+    if isinstance(stages, list) and stages:
+        new_stages = [dict(s) if isinstance(s, dict) else s for s in stages]
+        stage0 = new_stages[0] if isinstance(new_stages[0], dict) else {}
+        if sql is not None:
+            stage0["native"] = sql
+        if template_tags is not None:
+            stage0["template-tags"] = template_tags
+        new_stages[0] = stage0
+        new_dq["stages"] = new_stages
+        return new_dq
+
+    new_native = dict(dataset_query.get("native") or {})
+    if sql is not None:
+        new_native["query"] = sql
+    if template_tags is not None:
+        new_native["template-tags"] = template_tags
+    new_dq["native"] = new_native
+    return new_dq
+
+
+# =============================================================================
 # Tool Definitions - Query Operations
 # =============================================================================
 
@@ -594,38 +653,33 @@ async def update_card(
         if query is not None or template_tags is not None:
             current_card = await metabase_client.request("GET", f"/card/{card_id}")
             current_dq = current_card.get("dataset_query") or {}
-            current_native = current_dq.get("native") or {}
+            current_sql, _ = _read_native_stage(current_dq)
 
-            db = database_id
-            if db is None:
-                db = current_dq.get("database") or current_card.get("database_id")
-                await ctx.debug(f"Using existing database_id {db} for dataset_query update")
-
-            new_query = query if query is not None else current_native.get("query")
-            if not new_query:
+            new_sql = query if query is not None else current_sql
+            if not new_sql:
                 raise ToolError(
                     f"Cannot update card {card_id} dataset_query: no SQL text available "
-                    "(neither `query` provided nor existing native.query found)."
+                    "(neither `query` provided nor existing SQL found on the card)."
                 )
 
+            new_tags_arg: dict[str, Any] | None = None
             if template_tags is not None:
-                new_tags: dict[str, Any] = {}
+                new_tags_arg = {}
                 for tag_name, cfg in template_tags.items():
                     entry = dict(cfg)
                     entry.setdefault("name", tag_name)
-                    new_tags[tag_name] = entry
-            else:
-                new_tags = dict(current_native.get("template-tags") or {})
+                    new_tags_arg[tag_name] = entry
 
-            new_native = dict(current_native)
-            new_native["query"] = new_query
-            new_native["template-tags"] = new_tags
+            new_dq = _merge_native_stage(
+                current_dq, sql=new_sql, template_tags=new_tags_arg
+            )
+            if database_id is not None:
+                new_dq["database"] = database_id
+            elif "database" not in new_dq:
+                new_dq["database"] = current_card.get("database_id")
+            new_dq.setdefault("type", "native")
 
-            payload["dataset_query"] = {
-                "database": db,
-                "type": "native",
-                "native": new_native,
-            }
+            payload["dataset_query"] = new_dq
 
         if not payload:
             raise ToolError("No update fields provided. Specify at least one field to update.")
@@ -997,14 +1051,12 @@ async def set_card_template_tags(
                 f"(dataset_query.type = {dataset_query.get('type')!r}); "
                 "template tags only apply to native SQL cards."
             )
-        native = dataset_query.get("native") or {}
-        query_sql = native.get("query")
-        if not query_sql:
+        current_sql, existing_tags = _read_native_stage(dataset_query)
+        if not current_sql:
             raise ToolError(
-                f"Card {card_id} has no native.query text — refusing to PUT "
-                "because it would wipe the SQL. Set the SQL first via update_card."
+                f"Card {card_id} has no SQL text — refusing to PUT "
+                "because it would wipe the stage. Set the SQL first via update_card."
             )
-        existing_tags: dict[str, Any] = native.get("template-tags") or {}
 
         if merge:
             new_tags: dict[str, Any] = {k: dict(v) for k, v in existing_tags.items()}
@@ -1020,20 +1072,12 @@ async def set_card_template_tags(
                 entry.setdefault("name", name)
                 new_tags[name] = entry
 
-        # Preserve every field on `native` (query, collection, etc.) and only
-        # override template-tags. Build the new native dict explicitly so a
-        # missing `query` is impossible.
-        new_native: dict[str, Any] = dict(native)
-        new_native["query"] = query_sql
-        new_native["template-tags"] = new_tags
+        new_dq = _merge_native_stage(dataset_query, template_tags=new_tags)
+        if "database" not in new_dq:
+            new_dq["database"] = card.get("database_id")
+        new_dq.setdefault("type", "native")
 
-        payload = {
-            "dataset_query": {
-                "database": dataset_query.get("database") or card.get("database_id"),
-                "type": "native",
-                "native": new_native,
-            }
-        }
+        payload = {"dataset_query": new_dq}
 
         result = await metabase_client.request("PUT", f"/card/{card_id}", json=payload)
         await ctx.info(
