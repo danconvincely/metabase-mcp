@@ -547,9 +547,15 @@ async def update_card(
     collection_id: int | None = None,
     visualization_settings: dict[str, Any] | None = None,
     archived: bool | None = None,
+    template_tags: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Update properties of a saved question/card in Metabase.
+
+    When `query` is updated, existing template-tags on the card are preserved
+    by default (re-sent alongside the new SQL) so filters wired to the card
+    aren't silently wiped. Pass `template_tags` to set/replace them atomically
+    with the SQL update.
 
     Args:
         card_id: The ID of the card to update.
@@ -561,6 +567,9 @@ async def update_card(
         collection_id: Move the card to a different collection.
         visualization_settings: Visualization settings to apply.
         archived: Set to true to archive the card, false to unarchive.
+        template_tags: Replacement template-tags map (tag-name -> config). If
+            provided, replaces the card's template-tags. If omitted while
+            `query` is set, existing template-tags are preserved unchanged.
 
     Returns:
         The updated card object.
@@ -582,17 +591,40 @@ async def update_card(
             payload["visualization_settings"] = visualization_settings
         if archived is not None:
             payload["archived"] = archived
-        if query is not None:
+        if query is not None or template_tags is not None:
+            current_card = await metabase_client.request("GET", f"/card/{card_id}")
+            current_dq = current_card.get("dataset_query") or {}
+            current_native = current_dq.get("native") or {}
+
             db = database_id
             if db is None:
-                # Fetch current card to get existing database_id
-                current_card = await metabase_client.request("GET", f"/card/{card_id}")
-                db = current_card.get("database_id")
-                await ctx.debug(f"Using existing database_id {db} for query update")
+                db = current_dq.get("database") or current_card.get("database_id")
+                await ctx.debug(f"Using existing database_id {db} for dataset_query update")
+
+            new_query = query if query is not None else current_native.get("query")
+            if not new_query:
+                raise ToolError(
+                    f"Cannot update card {card_id} dataset_query: no SQL text available "
+                    "(neither `query` provided nor existing native.query found)."
+                )
+
+            if template_tags is not None:
+                new_tags: dict[str, Any] = {}
+                for tag_name, cfg in template_tags.items():
+                    entry = dict(cfg)
+                    entry.setdefault("name", tag_name)
+                    new_tags[tag_name] = entry
+            else:
+                new_tags = dict(current_native.get("template-tags") or {})
+
+            new_native = dict(current_native)
+            new_native["query"] = new_query
+            new_native["template-tags"] = new_tags
+
             payload["dataset_query"] = {
                 "database": db,
                 "type": "native",
-                "native": {"query": query},
+                "native": new_native,
             }
 
         if not payload:
@@ -861,6 +893,374 @@ async def create_dashboard(
 
 
 @mcp.tool
+async def update_dashboard(
+    dashboard_id: int,
+    ctx: Context,
+    name: str | None = None,
+    description: str | None = None,
+    collection_id: int | None = None,
+    parameters: list[dict[str, Any]] | None = None,
+    archived: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Update properties of a dashboard, including its parameter/filter list.
+
+    Use `parameters` to define dashboard-level filters. Each parameter is a dict
+    with keys like `id` (string, required — a stable identifier), `name`,
+    `slug`, `type` (e.g. "date/all-options", "date/single", "date/range",
+    "category", "string/=", "number/="), and optional `default`, `sectionId`,
+    `values_source_type`, `values_source_config`.
+
+    Args:
+        dashboard_id: The ID of the dashboard to update.
+        name: New name for the dashboard.
+        description: New description for the dashboard.
+        collection_id: Move the dashboard to a different collection.
+        parameters: Full replacement list of dashboard parameters.
+        archived: Set true to archive, false to unarchive.
+
+    Returns:
+        The updated dashboard object.
+    """
+    payload: dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if collection_id is not None:
+        payload["collection_id"] = collection_id
+    if parameters is not None:
+        payload["parameters"] = parameters
+    if archived is not None:
+        payload["archived"] = archived
+
+    if not payload:
+        raise ToolError("No update fields provided. Specify at least one field to update.")
+
+    try:
+        await ctx.info(f"Updating dashboard {dashboard_id}")
+        result = await metabase_client.request(
+            "PUT", f"/dashboard/{dashboard_id}", json=payload
+        )
+        await ctx.info(f"Successfully updated dashboard {dashboard_id}")
+        return result
+    except Exception as e:
+        error_msg = f"Error updating dashboard {dashboard_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def set_card_template_tags(
+    card_id: int,
+    template_tags: dict[str, dict[str, Any]],
+    ctx: Context,
+    merge: bool = True,
+) -> dict[str, Any]:
+    """
+    Set or update the template tags on a card's native SQL query.
+
+    Metabase auto-creates template tags for each `{{variable}}` in SQL, but they
+    default to type "text". Use this tool to change a tag's type (e.g. to "date"
+    or "number"), set a display name, default value, required flag, or
+    convert to a field filter ("dimension").
+
+    Each entry in `template_tags` is keyed by tag name and may include:
+      - type: "text" | "number" | "date" | "dimension" | "card" | "snippet"
+      - display-name: human-readable label
+      - default: default value
+      - required: bool
+      - dimension: [field-id, <id>]   # only for type "dimension"
+      - widget-type: e.g. "date/single", "date/range", "category"  # for dimension
+
+    Existing fields (including the auto-generated `id` UUID and `name`) are
+    preserved when `merge=True`.
+
+    Args:
+        card_id: The ID of the card whose native query tags should be updated.
+        template_tags: Map of tag-name -> tag-config.
+        merge: If True (default), merge with existing tags. If False, replace entirely.
+
+    Returns:
+        The updated card object.
+    """
+    if not template_tags:
+        raise ToolError("`template_tags` must contain at least one entry.")
+
+    try:
+        await ctx.info(f"Updating template tags on card {card_id}")
+        card = await metabase_client.request("GET", f"/card/{card_id}")
+        dataset_query = card.get("dataset_query") or {}
+        if dataset_query.get("type") != "native":
+            raise ToolError(
+                f"Card {card_id} is not a native-query card "
+                f"(dataset_query.type = {dataset_query.get('type')!r}); "
+                "template tags only apply to native SQL cards."
+            )
+        native = dataset_query.get("native") or {}
+        query_sql = native.get("query")
+        if not query_sql:
+            raise ToolError(
+                f"Card {card_id} has no native.query text — refusing to PUT "
+                "because it would wipe the SQL. Set the SQL first via update_card."
+            )
+        existing_tags: dict[str, Any] = native.get("template-tags") or {}
+
+        if merge:
+            new_tags: dict[str, Any] = {k: dict(v) for k, v in existing_tags.items()}
+            for name, cfg in template_tags.items():
+                current = dict(new_tags.get(name, {}))
+                current.update(cfg)
+                current.setdefault("name", name)
+                new_tags[name] = current
+        else:
+            new_tags = {}
+            for name, cfg in template_tags.items():
+                entry = dict(cfg)
+                entry.setdefault("name", name)
+                new_tags[name] = entry
+
+        # Preserve every field on `native` (query, collection, etc.) and only
+        # override template-tags. Build the new native dict explicitly so a
+        # missing `query` is impossible.
+        new_native: dict[str, Any] = dict(native)
+        new_native["query"] = query_sql
+        new_native["template-tags"] = new_tags
+
+        payload = {
+            "dataset_query": {
+                "database": dataset_query.get("database") or card.get("database_id"),
+                "type": "native",
+                "native": new_native,
+            }
+        }
+
+        result = await metabase_client.request("PUT", f"/card/{card_id}", json=payload)
+        await ctx.info(
+            f"Successfully updated {len(template_tags)} template tag(s) on card {card_id}"
+        )
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = f"Error updating template tags on card {card_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def update_card_parameters(
+    card_id: int,
+    parameters: list[dict[str, Any]],
+    ctx: Context,
+    merge: bool = False,
+) -> dict[str, Any]:
+    """
+    Set the card-level `parameters` list on a saved question.
+
+    Card parameters drive the filter widgets shown on a card's own page AND
+    are what Metabase uses to wire dashboard parameters into the card. For a
+    date filter to render as a date picker (instead of a plain text box), the
+    card must have a matching parameter entry — the template-tag type alone is
+    not enough.
+
+    Each parameter is a dict. Common keys:
+      - id: the template-tag's UUID (must match `dataset_query.native.template-tags[name].id`)
+      - name: display name, e.g. "Start date"
+      - slug: URL slug, e.g. "start_date"
+      - type: widget type, e.g. "date/single", "date/range", "date/all-options",
+              "category", "string/=", "number/="
+      - target: link back to the template tag, e.g.
+               ["variable", ["template-tag", "start_date"]] (for text/number/date vars)
+               ["dimension", ["template-tag", "start_date"]] (for field filters)
+      - default: default value (optional)
+      - values_source_type / values_source_config: dropdown data source (optional)
+      - values_query_type: "list" | "search" | "none" (optional)
+
+    Args:
+        card_id: The ID of the card whose parameters should be updated.
+        parameters: List of parameter configs. When `merge=False` (default)
+            this replaces the card's entire parameters list. When `merge=True`,
+            entries are matched by `id` (or by `slug` if `id` is missing) and
+            merged into existing parameters; new entries are appended.
+
+    Returns:
+        The updated card object.
+    """
+    if not parameters:
+        raise ToolError("`parameters` must contain at least one entry.")
+
+    try:
+        await ctx.info(f"Updating parameters on card {card_id}")
+
+        if merge:
+            card = await metabase_client.request("GET", f"/card/{card_id}")
+            existing: list[dict[str, Any]] = list(card.get("parameters") or [])
+
+            def key(p: dict[str, Any]) -> Any:
+                return p.get("id") or p.get("slug")
+
+            by_key = {key(p): dict(p) for p in existing if key(p) is not None}
+            ordered_keys = [key(p) for p in existing if key(p) is not None]
+
+            for incoming in parameters:
+                k = key(incoming)
+                if k is None:
+                    raise ToolError(
+                        "When merge=True, each parameter must include 'id' or 'slug'."
+                    )
+                if k in by_key:
+                    by_key[k].update(incoming)
+                else:
+                    by_key[k] = dict(incoming)
+                    ordered_keys.append(k)
+
+            new_params = [by_key[k] for k in ordered_keys]
+        else:
+            new_params = list(parameters)
+
+        result = await metabase_client.request(
+            "PUT", f"/card/{card_id}", json={"parameters": new_params}
+        )
+        await ctx.info(
+            f"Successfully updated {len(new_params)} parameter(s) on card {card_id}"
+        )
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = f"Error updating parameters on card {card_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def set_dashcard_parameter_mappings(
+    dashboard_id: int,
+    mappings: list[dict[str, Any]],
+    ctx: Context,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """
+    Wire dashboard parameters to card template tags on specific dashcards.
+
+    Each mapping entry must include:
+      - dashcard_id: the dashcard to target (from get_dashboard_cards)
+      - parameter_id: the dashboard parameter's `id` (set via update_dashboard)
+      - template_tag: the tag name used in the card's SQL (e.g. "start_date")
+
+    Optional per-entry fields:
+      - kind: "variable" (default) for plain `{{tag}}` vars, or "dimension" for
+        field-filter tags. Produces the correct `target` shape.
+      - card_id: overrides the dashcard's own card_id in the mapping (rare —
+        needed for series cards).
+      - target: raw Metabase `target` array; if provided, used verbatim and
+        overrides `kind`/`template_tag`.
+
+    Existing parameter_mappings on each touched dashcard are preserved and
+    extended, unless `replace=True` (in which case the mappings for each
+    touched dashcard are fully replaced by the entries provided here).
+    Dashcards not referenced in `mappings` are left untouched.
+
+    Args:
+        dashboard_id: The ID of the dashboard.
+        mappings: List of mapping entries as described above.
+        replace: If True, replace parameter_mappings on touched dashcards
+            instead of appending.
+
+    Returns:
+        The updated dashboard object.
+    """
+    if not mappings:
+        raise ToolError("`mappings` must contain at least one entry.")
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for idx, entry in enumerate(mappings):
+        dc_id = entry.get("dashcard_id")
+        param_id = entry.get("parameter_id")
+        if dc_id is None or param_id is None:
+            raise ToolError(
+                f"mappings[{idx}] must include 'dashcard_id' and 'parameter_id'."
+            )
+        raw_target = entry.get("target")
+        if raw_target is None:
+            tag = entry.get("template_tag")
+            if not tag:
+                raise ToolError(
+                    f"mappings[{idx}] must include 'template_tag' or 'target'."
+                )
+            kind = entry.get("kind", "variable")
+            if kind not in ("variable", "dimension"):
+                raise ToolError(
+                    f"mappings[{idx}] has invalid kind '{kind}'; use 'variable' or 'dimension'."
+                )
+            raw_target = [kind, ["template-tag", tag]]
+        grouped.setdefault(int(dc_id), []).append(
+            {
+                "parameter_id": param_id,
+                "card_id": entry.get("card_id"),
+                "target": raw_target,
+            }
+        )
+
+    try:
+        await ctx.info(
+            f"Updating parameter mappings on {len(grouped)} dashcard(s) of dashboard {dashboard_id}"
+        )
+        dashboard = await metabase_client.request("GET", f"/dashboard/{dashboard_id}")
+        existing_dashcards = dashboard.get("dashcards", dashboard.get("ordered_cards", []))
+
+        existing_ids = {dc.get("id") for dc in existing_dashcards}
+        unknown = [dc_id for dc_id in grouped if dc_id not in existing_ids]
+        if unknown:
+            raise ToolError(
+                f"Dashcard(s) {unknown} not found on dashboard {dashboard_id}."
+            )
+
+        dashcards = []
+        for dc in existing_dashcards:
+            entry = {
+                "id": dc["id"],
+                "card_id": dc.get("card_id"),
+                "row": dc.get("row"),
+                "col": dc.get("col"),
+                "size_x": dc.get("size_x"),
+                "size_y": dc.get("size_y"),
+                "parameter_mappings": list(dc.get("parameter_mappings") or []),
+                "visualization_settings": dc.get("visualization_settings") or {},
+            }
+            new_for_dc = grouped.get(dc.get("id"))
+            if new_for_dc is not None:
+                filled = [
+                    {
+                        "parameter_id": m["parameter_id"],
+                        "card_id": m["card_id"] if m["card_id"] is not None else dc.get("card_id"),
+                        "target": m["target"],
+                    }
+                    for m in new_for_dc
+                ]
+                if replace:
+                    entry["parameter_mappings"] = filled
+                else:
+                    entry["parameter_mappings"].extend(filled)
+            dashcards.append(entry)
+
+        result = await metabase_client.request(
+            "PUT", f"/dashboard/{dashboard_id}", json={"dashcards": dashcards}
+        )
+        await ctx.info(
+            f"Successfully updated parameter mappings on dashboard {dashboard_id}"
+        )
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = f"Error updating parameter mappings on dashboard {dashboard_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
 async def get_dashboard_cards(dashboard_id: int, ctx: Context) -> list[dict[str, Any]]:
     """
     Get the cards and their layout information for a specific dashboard.
@@ -940,7 +1340,7 @@ async def add_card_to_dashboard(
         dashboard = await metabase_client.request("GET", f"/dashboard/{dashboard_id}")
         existing_dashcards = dashboard.get("dashcards", dashboard.get("ordered_cards", []))
 
-        # Preserve existing dashcards with their current layout
+        # Preserve existing dashcards with their current layout and mappings
         dashcards = [
             {
                 "id": dc["id"],
@@ -949,6 +1349,8 @@ async def add_card_to_dashboard(
                 "col": dc.get("col"),
                 "size_x": dc.get("size_x"),
                 "size_y": dc.get("size_y"),
+                "parameter_mappings": list(dc.get("parameter_mappings") or []),
+                "visualization_settings": dc.get("visualization_settings") or {},
             }
             for dc in existing_dashcards
         ]
@@ -961,6 +1363,8 @@ async def add_card_to_dashboard(
             "col": col,
             "size_x": size_x,
             "size_y": size_y,
+            "parameter_mappings": [],
+            "visualization_settings": {},
         })
 
         result = await metabase_client.request(
@@ -1024,6 +1428,8 @@ async def update_dashboard_card_position(
                 "col": dc.get("col"),
                 "size_x": dc.get("size_x"),
                 "size_y": dc.get("size_y"),
+                "parameter_mappings": list(dc.get("parameter_mappings") or []),
+                "visualization_settings": dc.get("visualization_settings") or {},
             }
             if dc.get("id") == dashcard_id:
                 found = True
@@ -1114,6 +1520,8 @@ async def reposition_dashboard_cards(
                 "col": dc.get("col"),
                 "size_x": dc.get("size_x"),
                 "size_y": dc.get("size_y"),
+                "parameter_mappings": list(dc.get("parameter_mappings") or []),
+                "visualization_settings": dc.get("visualization_settings") or {},
             }
             update = updates_by_id.get(dc.get("id"))
             if update:
