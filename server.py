@@ -977,6 +977,166 @@ async def add_card_to_dashboard(
         raise ToolError(error_msg) from e
 
 
+@mcp.tool
+async def update_dashboard_card_position(
+    dashboard_id: int,
+    dashcard_id: int,
+    ctx: Context,
+    col: int | None = None,
+    row: int | None = None,
+    size_x: int | None = None,
+    size_y: int | None = None,
+) -> dict[str, Any]:
+    """
+    Reposition or resize a single card on a dashboard.
+
+    Only the provided fields are updated; omitted fields keep their current values.
+
+    Args:
+        dashboard_id: The ID of the dashboard.
+        dashcard_id: The ID of the dashcard (from get_dashboard_cards) to move or resize.
+        col: New column position on the dashboard grid.
+        row: New row position on the dashboard grid.
+        size_x: New width in grid units.
+        size_y: New height in grid units.
+
+    Returns:
+        The updated dashboard object.
+    """
+    if col is None and row is None and size_x is None and size_y is None:
+        raise ToolError("At least one of col, row, size_x, or size_y must be provided.")
+
+    try:
+        await ctx.info(
+            f"Updating position of dashcard {dashcard_id} on dashboard {dashboard_id}"
+        )
+
+        dashboard = await metabase_client.request("GET", f"/dashboard/{dashboard_id}")
+        existing_dashcards = dashboard.get("dashcards", dashboard.get("ordered_cards", []))
+
+        found = False
+        dashcards = []
+        for dc in existing_dashcards:
+            entry = {
+                "id": dc["id"],
+                "card_id": dc.get("card_id"),
+                "row": dc.get("row"),
+                "col": dc.get("col"),
+                "size_x": dc.get("size_x"),
+                "size_y": dc.get("size_y"),
+            }
+            if dc.get("id") == dashcard_id:
+                found = True
+                if col is not None:
+                    entry["col"] = col
+                if row is not None:
+                    entry["row"] = row
+                if size_x is not None:
+                    entry["size_x"] = size_x
+                if size_y is not None:
+                    entry["size_y"] = size_y
+            dashcards.append(entry)
+
+        if not found:
+            raise ToolError(
+                f"Dashcard {dashcard_id} not found on dashboard {dashboard_id}."
+            )
+
+        result = await metabase_client.request(
+            "PUT", f"/dashboard/{dashboard_id}", json={"dashcards": dashcards}
+        )
+        await ctx.info(
+            f"Successfully updated dashcard {dashcard_id} on dashboard {dashboard_id}"
+        )
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = (
+            f"Error updating dashcard {dashcard_id} on dashboard {dashboard_id}: {e}"
+        )
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
+@mcp.tool
+async def reposition_dashboard_cards(
+    dashboard_id: int,
+    positions: list[dict[str, Any]],
+    ctx: Context,
+) -> dict[str, Any]:
+    """
+    Reposition and/or resize multiple cards on a dashboard in a single update.
+
+    Use this to rearrange a dashboard layout atomically. Any dashcards not
+    included in `positions` keep their current layout.
+
+    Args:
+        dashboard_id: The ID of the dashboard.
+        positions: A list of layout updates. Each entry must include `dashcard_id`
+            and may include any of `col`, `row`, `size_x`, `size_y`. Omitted
+            fields on an entry keep their current values.
+
+    Returns:
+        The updated dashboard object.
+    """
+    if not positions:
+        raise ToolError("`positions` must contain at least one entry.")
+
+    updates_by_id: dict[int, dict[str, Any]] = {}
+    for idx, entry in enumerate(positions):
+        dc_id = entry.get("dashcard_id")
+        if dc_id is None:
+            raise ToolError(f"positions[{idx}] is missing required field 'dashcard_id'.")
+        updates_by_id[int(dc_id)] = entry
+
+    try:
+        await ctx.info(
+            f"Repositioning {len(updates_by_id)} cards on dashboard {dashboard_id}"
+        )
+
+        dashboard = await metabase_client.request("GET", f"/dashboard/{dashboard_id}")
+        existing_dashcards = dashboard.get("dashcards", dashboard.get("ordered_cards", []))
+
+        existing_ids = {dc.get("id") for dc in existing_dashcards}
+        unknown = [dc_id for dc_id in updates_by_id if dc_id not in existing_ids]
+        if unknown:
+            raise ToolError(
+                f"Dashcard(s) {unknown} not found on dashboard {dashboard_id}."
+            )
+
+        dashcards = []
+        for dc in existing_dashcards:
+            entry = {
+                "id": dc["id"],
+                "card_id": dc.get("card_id"),
+                "row": dc.get("row"),
+                "col": dc.get("col"),
+                "size_x": dc.get("size_x"),
+                "size_y": dc.get("size_y"),
+            }
+            update = updates_by_id.get(dc.get("id"))
+            if update:
+                for field in ("col", "row", "size_x", "size_y"):
+                    if update.get(field) is not None:
+                        entry[field] = update[field]
+            dashcards.append(entry)
+
+        result = await metabase_client.request(
+            "PUT", f"/dashboard/{dashboard_id}", json={"dashcards": dashcards}
+        )
+        await ctx.info(
+            f"Successfully repositioned {len(updates_by_id)} cards on dashboard {dashboard_id}"
+        )
+        return result
+    except ToolError:
+        raise
+    except Exception as e:
+        error_msg = f"Error repositioning cards on dashboard {dashboard_id}: {e}"
+        await ctx.error(error_msg)
+        raise ToolError(error_msg) from e
+
+
 # =============================================================================
 # Tool Definitions - Collection Operations
 # =============================================================================
